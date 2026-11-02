@@ -38,6 +38,19 @@
 
 ![Settings panel](docs/settings.png)
 
+## AI stem isolation (optional)
+
+The multi-clip timeline can split a clip into vocals, instrumental, drums, bass, guitar, piano and other sounds,
+locally with [Demucs](https://github.com/facebookresearch/demucs). The engine is installed separately:
+
+1. Install 64-bit [Python 3.13](https://www.python.org/downloads/windows/) (keep the "py launcher" option ticked).
+2. Download `setup-isolation.ps1` from the [latest release](https://github.com/Veloxstudios/resonate-desktop/releases/latest)
+   and put it next to `Resonate-Desktop.exe`.
+3. Run `powershell -ExecutionPolicy Bypass -File setup-isolation.ps1`. NVIDIA GPUs get the CUDA build
+   automatically (about 2.5 GB); add `-Cpu` for the smaller CPU-only build.
+
+AMD Radeon support through DirectML (`setup-isolation-directml.ps1`) is experimental and untested on Radeon hardware.
+
 ## Run from source
 
 Requires Python 3.10+ on Windows.

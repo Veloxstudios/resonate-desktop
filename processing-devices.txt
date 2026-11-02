@@ -1,0 +1,29 @@
+Resonate AI processing devices
+
+AI isolation runs a local Demucs engine that is installed separately from Resonate Desktop.exe.
+
+Install the engine (CPU or NVIDIA):
+1. Install 64-bit Python 3.13 from python.org (keep the "py launcher" option ticked).
+2. Download setup-isolation.ps1 from the Resonate release page and put it in the same folder as Resonate Desktop.exe.
+3. Right-click it > Run with PowerShell, or run:
+     powershell -ExecutionPolicy Bypass -File setup-isolation.ps1
+   NVIDIA GPUs get the CUDA build automatically (about 2.5 GB). Add -Cpu for the smaller CPU-only build.
+4. Restart Resonate. The setup creates an "isolation-engine" folder beside the app.
+
+Settings > AI isolation device:
+- Auto: use an available CUDA device, otherwise DirectML if its optional engine is installed, otherwise CPU.
+- CPU: always run the model on CPU.
+- NVIDIA CUDA: use CUDA; unavailable hardware or GPU execution failures retry on CPU.
+- AMD DirectML (experimental): use the separate DirectML engine; unsupported model operations retry on CPU.
+
+NVIDIA CUDA has been tested on an RTX 4060. AMD/DirectML has not been tested on Radeon hardware, so it is experimental.
+
+Radeon setup (experimental):
+1. Install 64-bit Python 3.12 and an up-to-date Radeon driver.
+2. Put setup-isolation-directml.ps1 next to Resonate Desktop.exe and run it.
+3. Choose AMD DirectML (experimental) in Settings.
+The setup creates isolation-engine-directml separately and does not replace the CPU/NVIDIA engine.
+
+The Demucs adapter keeps unsupported complex FFT operations on CPU while attempting neural-network inference on DirectML. Whether it accelerates a given Radeon GPU depends on device/driver/operator support. A notice is shown when CPU fallback is used.
+
+Audio trimming and FFmpeg audio conversion use CPU; this switch only controls AI stem isolation.

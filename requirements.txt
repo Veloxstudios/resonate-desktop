@@ -4,3 +4,4 @@ imageio-ffmpeg>=0.5
 pyinstaller>=6.0
 
 mutagen>=1.47
+numpy>=2.0

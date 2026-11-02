@@ -4,7 +4,6 @@ import math
 import time
 import tkinter as tk
 import wave
-import array
 import queue
 import json
 import os
@@ -16,10 +15,12 @@ import webbrowser
 from tkinter import filedialog
 
 import customtkinter as ctk
+from dropdowns import ResonateDropdown
+import numpy as np
 from PIL import Image, ImageOps, ImageDraw, ImageTk, ImageGrab
 
 APP_NAME = "Resonate Desktop"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 REPO_URL = "https://github.com/Veloxstudios/resonate-desktop"
 ICON_FILE = "resonate-taskbar.ico"
 SETTINGS_ICON_FILE = "settings.ico"
@@ -38,12 +39,16 @@ FORMATS = {
     "WMA": ("wma", ["-c:a", "wmav2"], True),
     "AIFF": ("aiff", ["-c:a", "pcm_s16be"], False),
 }
+# Source codec (as ffmpeg names it) that each output format can copy without re-encoding.
+COPY_CODECS = {"MP3": "mp3", "WAV": "pcm_s16le", "FLAC": "flac", "AAC": "aac", "ALAC": "alac",
+               "OGG": "vorbis", "OPUS": "opus", "WMA": "wmav2", "AIFF": "pcm_s16be"}
 BITRATES = ["64k", "96k", "128k", "160k", "192k", "256k", "320k"]
 SAMPLE_RATES = ["Original", "22050", "44100", "48000", "96000"]
 CHANNELS = ["Original", "Mono", "Stereo"]
 DESTINATIONS = ["Same folder", "Choose"]
 
 DEFAULT_PREFS = {
+    "isolation_device": "Auto",
     "theme": "Dark",
     "format": "MP3",
     "bitrate": "192k",
@@ -56,7 +61,7 @@ DEFAULT_PREFS = {
     "open_folder": False,
     "sound": True,
 }
-PREF_CHOICES = {"theme": ["Light", "Dark"], "format": list(FORMATS), "bitrate": BITRATES, "sample_rate": SAMPLE_RATES,
+PREF_CHOICES = {"isolation_device": ["Auto", "CPU", "NVIDIA CUDA", "AMD DirectML (experimental)"], "theme": ["Light", "Dark"], "format": list(FORMATS), "bitrate": BITRATES, "sample_rate": SAMPLE_RATES,
                 "channels": CHANNELS, "destination": DESTINATIONS}
 
 INPUT_EXTS = (".mp3 .wav .flac .m4a .aac .ogg .opus .wma .aiff .aif .alac .amr .ac3 "
@@ -155,6 +160,81 @@ def get_duration(ffmpeg, path):
         return 0.0
     h, mnt, s = m.groups()
     return int(h) * 3600 + int(mnt) * 60 + float(s)
+
+
+def probe_audio(ffmpeg, path):
+    """Duration and first audio stream details from ffmpeg's file info."""
+    result = subprocess.run([ffmpeg, "-hide_banner", "-i", path], capture_output=True, text=True,
+                            errors="replace", creationflags=NO_WINDOW)
+    info = {"duration": 0.0, "codec": None, "rate": 0, "channels": "", "bitrate": 0, "error": ""}
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+    if m:
+        h, mnt, s = m.groups()
+        info["duration"] = int(h) * 3600 + int(mnt) * 60 + float(s)
+    line = next((l for l in result.stderr.splitlines() if "Stream #" in l and "Audio:" in l), "")
+    if line:
+        codec = re.search(r"Audio: (\w+)", line)
+        rate = re.search(r"(\d+) Hz", line)
+        channels = re.search(r"Hz, ([^,(]+)", line)
+        bitrate = re.search(r"(\d+) kb/s", line)
+        info.update(codec=codec and codec.group(1), rate=int(rate.group(1)) if rate else 0,
+                    channels=channels.group(1).strip() if channels else "",
+                    bitrate=int(bitrate.group(1)) if bitrate else 0)
+    elif "Input #0" not in result.stderr:
+        lines = [l.strip() for l in result.stderr.splitlines() if l.strip()]
+        info["error"] = lines[-1] if lines else "FFmpeg could not read this file"
+    return info
+
+
+def column_peaks(values, origin, bin_seconds, start, span, count):
+    """Largest peak (0..1) in each of `count` equal columns covering [start, start+span).
+
+    `values` holds one peak per bin of `bin_seconds`, the first bin starting at `origin`.
+    """
+    n = len(values)
+    if not n or count < 1:
+        return np.zeros(max(count, 0), np.float32)
+    edges = (start - origin + np.arange(count + 1) * (span / count)) / bin_seconds
+    if span / count >= bin_seconds:
+        # One or more whole bins per column: take the exact maximum, never skip a transient.
+        lo = np.clip(np.floor(edges[:-1]).astype(np.int64), 0, n - 1)
+        hi = np.maximum(np.clip(np.ceil(edges[1:]).astype(np.int64), 1, n), lo + 1)
+        out = np.maximum.reduceat(values[lo[0]:hi[-1]], lo - lo[0]).astype(np.float32)
+    else:
+        # Columns are narrower than a bin: interpolate between neighbouring bins, reading only the
+        # visible slice (the whole envelope can hold millions of bins).
+        centers = (edges[:-1] + edges[1:]) / 2 - .5
+        first = int(np.clip(np.floor(centers[0]), 0, n - 1)); last = int(np.clip(np.ceil(centers[-1]) + 1, first + 1, n))
+        out = np.interp(centers, np.arange(first, last), values[first:last]).astype(np.float32)
+    out[(edges[1:] <= 0) | (edges[:-1] >= n)] = 0
+    return out / 32768
+
+
+class PeakPyramid:
+    """Peak envelopes at several resolutions, so any zoom level reads a few thousand values at most."""
+
+    BIN, FACTOR = 128, 4
+
+    def __init__(self, base, rate):
+        self.rate = rate
+        self.levels = [base]
+        while len(self.levels[-1]) > 2048:
+            prev = self.levels[-1]
+            whole = len(prev) // self.FACTOR * self.FACTOR
+            level = prev[:whole].reshape(-1, self.FACTOR).max(axis=1)
+            if whole < len(prev):
+                level = np.append(level, prev[whole:].max())
+            self.levels.append(level)
+
+    def bin_seconds(self, level):
+        return self.BIN * self.FACTOR ** level / self.rate
+
+    def level_for(self, column_seconds):
+        """The coarsest level that still has at least one bin per column."""
+        level = 0
+        while level + 1 < len(self.levels) and self.bin_seconds(level + 1) <= column_seconds:
+            level += 1
+        return level
 
 
 def font(size, weight="Semilight"):
@@ -459,6 +539,9 @@ class AudioEditor(ctk.CTkFrame):
     # Timeline label spacing in seconds; the smallest that leaves ~70 px between labels wins.
     STEPS = (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600)
     PLAYHEAD = "#ff6b6b"
+    HELP = "Drag across the waveform to select a range. Drag the timeline to scrub. Tags and trim apply to the converted copy."
+    STALL_SECONDS = 30   # FFmpeg producing nothing for this long counts as stuck
+    CHUNK = 1 << 19      # bytes of PCM analysed per read; keeps memory flat for any file length
 
     def __init__(self, app, row):
         super().__init__(app,fg_color=BG,corner_radius=0)
@@ -466,35 +549,44 @@ class AudioEditor(ctk.CTkFrame):
         self.lift()
         app.active_editor=self
         self.row,self.app= row,app
-        self.duration=0; self.peaks=[]; self.result=queue.Queue()
+        self.duration=0; self.pyramid=None; self.result=queue.Queue()
+        self.loading=False; self.decode_proc=None; self.decode_cancel=False; self.stalled=False
+        self.decoded=0.0; self.estimate=0.0; self.began=self.last_data=0.0
         self.fields={}
-        self.position=0.0; self.playing=False; self.preview=None; self.preview_proc=None
+        self.position=0.0; self.playing=False; self.preview=None
         self.alias=f"resonate_preview_{id(self)}"; self.closed=False
         self.mode=None; self.last_seek=0.0; self.tick_job=None
         self.zoom=1.0;self.view_start=0.0
         self.zoom_job=None;self.zoom_target=1.0;self.zooming=False
         self.precise_timer=False;self.draw_items={};self.hidden_items=set();self.ruler_text={};self.draw_style=None;self.last_clock=None
         self.app.activity_wave.animate(False)
-        self.detail_draw_key=None
-        self.detail_result=queue.Queue();self.detail_key=None;self.detail_peaks=None
-        self.detail_serial=0;self.detail_job=None
+        # Deep-zoom detail comes from one worker thread; only the newest request is ever processed.
+        self.detail_result=queue.Queue();self.detail_key=None;self.detail=None
+        self.detail_serial=0;self.detail_job=None;self.detail_request=None
+        self.detail_event=threading.Event();self.detail_worker=None
         header=ctk.CTkFrame(self,fg_color="transparent");header.pack(fill="x",padx=24,pady=(18,8))
         MotionButton(header,text="← Back",width=85,command=self.destroy).pack(side="left",padx=(0,18))
         ctk.CTkLabel(header,text="Audio editor",font=font(24),text_color=TEXT).pack(side="left")
+        MotionButton(header,text="Multi-clip timeline",width=140,command=app.open_timeline).pack(side="right",padx=8)
         ctk.CTkLabel(header,text=elide(os.path.basename(row.path),40),font=font(12),text_color=MUTED).pack(side="right")
         body=ctk.CTkScrollableFrame(self,fg_color=BG,corner_radius=0)
         body.pack(fill="both",expand=True,padx=8,pady=(0,12))
+        body._parent_canvas.configure(yscrollcommand=self.deferred_scroll(body._scrollbar))
         zoom_bar=ctk.CTkFrame(body,fg_color="transparent");zoom_bar.pack(fill="x",padx=16,pady=8)
         ctk.CTkLabel(zoom_bar,text="AUDIO  /  TRIM",font=font(11),text_color=MUTED).pack(side="left")
         MotionButton(zoom_bar,text="Fit",width=45,command=lambda:self.set_zoom(1)).pack(side="right",padx=3)
         MotionButton(zoom_bar,text="Selection",width=85,command=self.zoom_selection).pack(side="right",padx=3)
         MotionButton(zoom_bar,text="+",width=34,command=lambda:self.set_zoom(self.zoom_target*1.45)).pack(side="right",padx=3)
         MotionButton(zoom_bar,text="−",width=34,command=lambda:self.set_zoom(self.zoom_target/1.45)).pack(side="right",padx=3)
-        self.zoom_label=ctk.CTkLabel(zoom_bar,text="1×",text_color=MUTED,width=60);self.zoom_label.pack(side="right",padx=8)
+        self.zoom_label=ctk.CTkLabel(zoom_bar,text="1.0×",text_color=MUTED,width=60);self.zoom_label.pack(side="right",padx=8)
         self.canvas=tk.Canvas(body,height=self.WAVE_H+self.RULER_H,bg="#101018",highlightthickness=0)
         self.canvas.pack(fill="x",padx=16,pady=(0,0))
         self.scrollbar=ctk.CTkScrollbar(body,orientation="horizontal",command=self.scroll_timeline)
         self.scrollbar.pack(fill="x",padx=16,pady=(0,10))
+        # Loading progress is drawn on the empty canvas and the button floats over it, so showing
+        # and hiding them never re-lays-out the scrollable editor (CTk redraws are slow there).
+        self.load_btn=MotionButton(body,text="Cancel",width=80,command=self.cancel_or_retry)
+        self.load_state=("",0.0,False)
         self.canvas.bind("<MouseWheel>",self.wheel)
         self.canvas.bind("<Left>",lambda e:self.nudge(-.01))
         self.canvas.bind("<Right>",lambda e:self.nudge(.01))
@@ -506,6 +598,7 @@ class AudioEditor(ctk.CTkFrame):
         self.canvas.bind("<ButtonRelease-1>",self.end_drag)
         self.canvas.bind("<Motion>",self.hover)
         transport=ctk.CTkFrame(body,fg_color="transparent");transport.pack(fill="x",padx=24,pady=(0,6))
+        self.transport=transport
         self.play_btn=MotionButton(transport,text="Play",width=80,command=self.toggle_play,state="disabled")
         self.play_btn.pack(side="left")
         self.clock_label=ctk.CTkLabel(transport,text="0:00.0 / 0:00.0",font=font(13),text_color=MUTED)
@@ -535,8 +628,14 @@ class AudioEditor(ctk.CTkFrame):
             ctk.CTkLabel(form,text=key.replace("tracknumber","Track number").title(),text_color=MUTED).grid(row=i,column=0,sticky="w",padx=(0,14),pady=3)
             var=ctk.StringVar(value=tags.get(key,""));self.fields[key]=var
             ctk.CTkEntry(form,textvariable=var).grid(row=i,column=1,sticky="ew",pady=3)
-        self.notice=ctk.CTkLabel(body,text="Loading waveform…",text_color=MUTED,wraplength=640)
+        self.notice=ctk.CTkLabel(body,text=self.HELP,text_color=MUTED,wraplength=640)
         self.notice.pack(pady=4)
+        fast_row=ctk.CTkFrame(body,fg_color="transparent");fast_row.pack(fill="x",padx=24,pady=(6,0))
+        self.fast_var=ctk.BooleanVar(value=bool(row.edits.get("fast",False)))
+        app.switch(fast_row,"Fast trim (copy audio without re-encoding)",self.fast_var,self.update_fast_hint).pack(anchor="w")
+        self.fast_hint=ctk.CTkLabel(fast_row,text="",font=font(11),text_color=MUTED,justify="left",anchor="w",wraplength=620)
+        self.fast_hint.pack(anchor="w",pady=(2,0))
+        self.update_fast_hint()
         actions=ctk.CTkFrame(body,fg_color="transparent");actions.pack(pady=8)
         MotionButton(actions,text="Apply to converted copy",width=210,command=self.apply).pack(side="left",padx=6)
         self.save_tags=MotionButton(actions,text="Save ID3 to source MP3",width=190,command=self.save_id3)
@@ -544,13 +643,24 @@ class AudioEditor(ctk.CTkFrame):
         if not row.path.lower().endswith(".mp3"): self.save_tags.configure(state="disabled")
         self.poll_job=None
         self.bind("<Destroy>",self.cleanup,add="+")
-        threading.Thread(target=self.decode,daemon=True).start()
-        self.poll()
+        self.start_decode()
 
     def destroy(self):
         if not self.closed:
             self.cleanup(type("Event",(),{"widget":self})())
         super().destroy()
+
+    def deferred_scroll(self,bar):
+        """CTkScrollbar.set flushes all pending layout. Called directly by the scrolling canvas it
+        recurses through every resize (over a second per change), so apply only the latest position, once per idle."""
+        latest=[]
+        def flush():
+            values=latest.pop()
+            if bar.winfo_exists():bar.set(*values)
+        def command(first,last):
+            if not latest:self.after_idle(flush)
+            latest[:]=[(first,last)]
+        return command
 
     def cleanup(self,event):
         if event.widget is not self:return
@@ -561,19 +671,29 @@ class AudioEditor(ctk.CTkFrame):
         self.app.active_editor=None
         self.precision_timer(False)
         if self.app.winfo_exists() and self.app.activity_wave.winfo_exists():self.app.activity_wave.animate(True)
-        self.detail_serial+=1
+        self.detail_serial+=1;self.detail_event.set()
         for job in ("poll_job","tick_job","detail_job","zoom_job"):
             if getattr(self,job) is not None:self.after_cancel(getattr(self,job));setattr(self,job,None)
         self.mci(f"close {self.alias}")
-        if self.preview_proc is not None and self.preview_proc.poll() is None:self.preview_proc.kill()
+        self.stop_decode()
         self.discard_preview()
+        if self.preview:threading.Thread(target=self.discard_preview,args=(True,),daemon=True).start()
 
-    def discard_preview(self):
-        if self.preview:
-            # A killed ffmpeg may still hold the file; the decode thread retries once it exits.
+    def stop_decode(self):
+        proc=self.decode_proc
+        if proc is not None and proc.poll() is None:
+            try:proc.kill()
+            except OSError:pass
+
+    def discard_preview(self,patient=False):
+        """Delete the temp WAV. Off the UI thread, keep trying for a few seconds: a just-killed
+        FFmpeg or a virus scanner can hold a freshly written file briefly."""
+        for attempt in range(30 if patient else 1):
+            if not self.preview:return
             try:os.remove(self.preview);self.preview=None
             except FileNotFoundError:self.preview=None
-            except OSError:pass
+            except OSError:
+                if patient:time.sleep(.1)
 
     def mci(self,command,buffer=None):
         """Send one Windows MCI command; returns 0 on success."""
@@ -581,54 +701,151 @@ class AudioEditor(ctk.CTkFrame):
         import ctypes
         return ctypes.windll.winmm.mciSendStringW(command,buffer,len(buffer) if buffer is not None else 0,None)
 
-    def make_preview(self,duration):
-        """Decode a temporary WAV so any input format can be played and seeked."""
-        import tempfile
-        handle,path=tempfile.mkstemp(prefix="resonate-preview-",suffix=".wav");os.close(handle)
-        self.preview=path
-        # Keep hour-long files to a manageable temp size.
-        layout=["-ac","2","-ar","44100"] if duration<=900 else ["-ac","1","-ar","22050"]
-        try:
-            self.preview_proc=subprocess.Popen([self.app.ffmpeg,"-v","error","-y","-i",self.row.path,"-vn",*layout,"-c:a","pcm_s16le",path],
-                                               stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=NO_WINDOW)
-            ok=self.preview_proc.wait()==0
-        except OSError:ok=False
-        if self.closed:self.discard_preview();return
-        self.result.put(("preview",ok))
+    def start_decode(self):
+        self.loading=True;self.decode_cancel=False;self.stalled=False
+        self.decoded=0.0;self.estimate=0.0;self.began=self.last_data=time.monotonic()
+        self.load_btn.configure(text="Cancel",state="normal")
+        self.load_btn.place(in_=self.canvas,relx=.5,y=172,anchor="n")
+        self.draw_loading("Reading file…",0.0,False)
+        self.set_notice(self.HELP)
+        threading.Thread(target=self.decode,daemon=True).start()
+        if self.poll_job is None:self.poll()
+
+    def set_notice(self,text,color=MUTED):
+        # A changed label re-lays-out the whole scrollable editor, so skip no-op updates.
+        if (text,color)!=getattr(self,"notice_state",(self.HELP,MUTED)):
+            self.notice.configure(text=text,text_color=color)
+        self.notice_state=(text,color)
+
+    def cancel_or_retry(self):
+        if self.loading:
+            self.decode_cancel=True;self.stop_decode()
+            self.load_btn.configure(state="disabled");self.draw_loading("Cancelling…",self.load_state[1])
+        else:self.start_decode()
 
     def decode(self):
+        """One FFmpeg pass feeds both the waveform analysis (a PCM pipe) and the playback WAV."""
+        import tempfile
+        path=None
         try:
-            duration=get_duration(self.app.ffmpeg,self.row.path)
-            # The overview is capped at ~60k samples even for very long files.
-            rate=max(1,min(1000,int(60000/max(duration,1))))
-            result=subprocess.run([self.app.ffmpeg,"-v","error","-i",self.row.path,"-vn","-ac","1","-ar",str(rate),"-f","s16le","-"],capture_output=True,creationflags=NO_WINDOW,timeout=120)
-            if result.returncode: raise ValueError("Could not decode this file's audio")
-            samples=array.array("h");samples.frombytes(result.stdout)
-            step=max(1,len(samples)//600)
-            peaks=[max((abs(v) for v in samples[i:i+step]),default=0)/32768 for i in range(0,len(samples),step)]
-            if duration<=0 or not peaks: raise ValueError("No audio found")
-            self.result.put(("peaks",duration,peaks,None))
+            info=probe_audio(self.app.ffmpeg,self.row.path)
+            if info["error"]:raise ValueError(f"FFmpeg couldn't read this file: {info['error']}")
+            if not info["codec"]:raise ValueError("This file has no audio track.")
+            self.estimate=info["duration"]
+            # Analyse at the source rate (capped at 48 kHz) so short transients still show.
+            rate=min(info["rate"] or 44100,48000);channels=1 if info["channels"]=="mono" else 2
+            # Playback copy: full quality up to 15 minutes, then mono 22 kHz to keep the temp file small.
+            short=0<self.estimate<=900
+            play=["-ac","2","-ar","44100"] if short else ["-ac","1","-ar","22050"]
+            handle,path=tempfile.mkstemp(prefix="resonate-preview-",suffix=".wav");os.close(handle)
+            self.preview=path
+            if self.closed or self.decode_cancel:raise InterruptedError()
+            proc=subprocess.Popen([self.app.ffmpeg,"-v","error","-nostdin","-y","-i",self.row.path,
+                                   "-map","0:a:0","-ac",str(channels),"-ar",str(rate),"-f","s16le","pipe:1",
+                                   "-map","0:a:0",*play,"-c:a","pcm_s16le",path],
+                                  stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=NO_WINDOW)
+            self.decode_proc=proc
+            errors=[]
+            threading.Thread(target=lambda:errors.extend(proc.stderr),daemon=True).start()
+            frame=2*channels;block=PeakPyramid.BIN*frame
+            parts=[];carry=b"";total=0
+            while True:
+                data=proc.stdout.read(self.CHUNK)
+                if not data or self.closed or self.decode_cancel:break
+                total+=len(data);self.last_data=time.monotonic();self.decoded=total/frame/rate
+                data=carry+data;whole=len(data)//block*block;carry=data[whole:]
+                if whole:
+                    samples=np.frombuffer(data,dtype="<i2",count=whole//2).reshape(-1,PeakPyramid.BIN*channels)
+                    parts.append(np.maximum(samples.max(axis=1).astype(np.int32),
+                                            -samples.min(axis=1).astype(np.int32)).astype(np.uint16))
+            if self.closed or self.decode_cancel:
+                self.stop_decode();proc.wait();raise InterruptedError()
+            if len(carry)>=frame:
+                tail=np.frombuffer(carry,dtype="<i2",count=len(carry)//2)
+                parts.append(np.array([max(int(tail.max()),-int(tail.min()))],dtype=np.uint16))
+            code=proc.wait()
+            if self.stalled:raise ValueError(f"FFmpeg stopped responding for {self.STALL_SECONDS} seconds.")
+            if code:
+                lines=[l.decode("utf-8","replace").strip() for l in errors if l.strip()]
+                detail=lines[-1] if lines else f"FFmpeg exited with code {code}"
+                raise ValueError("No audio track found." if "matches no streams" in detail else f"Couldn't decode this file: {detail}")
+            if not parts:raise ValueError("No audio found in this file.")
+            self.result.put(("ready",total/frame/rate,PeakPyramid(np.concatenate(parts),rate)))
+        except InterruptedError:
+            self.discard_preview(True)
+            if not self.closed:self.result.put(("cancelled",))
         except Exception as error:
-            self.result.put(("peaks",0,[],str(error)));return
-        if sys.platform=="win32" and not self.closed:self.make_preview(duration)
+            self.stop_decode()
+            # The temp WAV can only be deleted once FFmpeg has let go of it.
+            if self.decode_proc is not None:
+                try:self.decode_proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:pass
+            self.discard_preview(True)
+            if not self.closed:self.result.put(("failed",str(error)))
+        if self.closed:self.discard_preview(True)
 
     def poll(self):
         self.poll_job=None
-        try: message=self.result.get_nowait()
-        except queue.Empty:
-            self.poll_job=self.after(50,self.poll);return
-        if message[0]=="preview":
-            if message[1] and self.mci(f'open "{self.preview}" type waveaudio alias {self.alias}')==0:
+        try:
+            while True:self.handle_message(self.result.get_nowait())
+        except queue.Empty:pass
+        if self.loading and not self.closed:
+            self.show_progress()
+            self.poll_job=self.after(100,self.poll)
+
+    def show_progress(self):
+        now=time.monotonic();elapsed=now-self.began
+        proc=self.decode_proc
+        if proc is not None and proc.poll() is None and not self.decode_cancel and now-self.last_data>self.STALL_SECONDS:
+            self.stalled=True;self.stop_decode()
+        if self.decode_cancel:return
+        parts=[f"{self.clock(elapsed,False)} elapsed"];fraction=0.0
+        if self.decoded:parts.insert(0,f"{self.clock(self.decoded,False)} decoded")
+        if self.estimate:
+            fraction=min(1,self.decoded/self.estimate);parts.insert(0,f"{fraction:.0%}")
+        if elapsed>1 and self.decoded:parts.append(f"{self.decoded/elapsed:.0f}× realtime")
+        self.draw_loading("  ·  ".join(parts),fraction)
+
+    def draw_loading(self,text=None,fraction=None,failed=None):
+        """Progress, or the failure message, drawn in the empty waveform area."""
+        old_text,old_fraction,old_failed=self.load_state
+        self.load_state=(old_text if text is None else text,old_fraction if fraction is None else fraction,
+                         old_failed if failed is None else failed)
+        text,fraction,failed=self.load_state
+        light=ctk.get_appearance_mode()=="Light"
+        canvas=self.canvas;canvas.delete("loading")
+        width=max(1,canvas.winfo_width());middle=width/2
+        canvas.configure(bg="#eeeeef" if light else "#0e0e10")
+        title="Couldn't load this file" if failed else "Preparing waveform and playback"
+        canvas.create_text(middle,74,text=title,fill="#333338" if light else "#e6e6ee",font=("Segoe UI",13),tags="loading")
+        if not failed:
+            left=middle-160;right=middle+160
+            canvas.create_rectangle(left,106,right,110,fill="#d0d0d8" if light else "#24242c",outline="",tags="loading")
+            if fraction>0:canvas.create_rectangle(left,106,left+320*fraction,110,fill="#8e8aff",outline="",tags="loading")
+        canvas.create_text(middle,136,text=text,width=max(100,width-80),justify="center",
+                           fill=BAD if failed else ("#555560" if light else "#9a9aa6"),font=("Segoe UI",10),tags="loading")
+
+    def handle_message(self,message):
+        kind=message[0]
+        if kind=="ready":
+            self.loading=False;self.load_btn.place_forget();self.canvas.delete("loading")
+            self.draw_style=None  # the loading screen changed the canvas background
+            self.duration,self.pyramid=message[1],message[2]
+            if not self.row.edits.get("end"):self.end_var.set(f"{self.duration:.3f}")
+            self.set_notice(self.HELP)
+            if self.preview and self.mci(f'open "{self.preview}" type waveaudio alias {self.alias}')==0:
                 self.mci(f"set {self.alias} time format milliseconds");self.play_btn.configure(state="normal")
             else:self.notice.configure(text="Playback isn't available for this file. Trimming still works.",text_color=MUTED)
+            self.paint()
             return
-        _,duration,peaks,error=message
-        if error: self.notice.configure(text=error,text_color=BAD);return
-        self.duration,self.peaks=duration,peaks
-        if not self.row.edits.get("end"):self.end_var.set(f"{duration:.3f}")
-        self.notice.configure(text="Drag across the waveform to select a range. Drag the timeline to scrub. Tags and trim apply to the converted copy.")
-        self.paint()
-        if sys.platform=="win32":self.poll_job=self.after(50,self.poll)
+        self.loading=False
+        self.load_btn.configure(text="Retry",state="normal")
+        if kind=="cancelled":
+            self.draw_loading("Loading cancelled. Retry to see the waveform and play the file.",0.0)
+            self.notice.configure(text="Loading was cancelled.",text_color=MUTED)
+        else:
+            self.draw_loading(message[1],0.0,True)
+            self.notice.configure(text=message[1],text_color=BAD)
 
     @staticmethod
     def clock(seconds,precise=True):
@@ -715,39 +932,65 @@ class AudioEditor(ctk.CTkFrame):
         if event.state&1:
             self.scroll_timeline("scroll",-direction,"units");return "break"
 
-    def request_detail(self):
-        if self.zooming or not self.preview or self.span>45 or self.closed:return
-        key=(round(self.view_start,4),round(self.span,4),self.canvas.winfo_width())
+    def visible_peaks(self,start,span,count):
+        """Peak (0..1) per drawn column, from the cached envelope level that fits the zoom."""
+        pyramid=self.pyramid;column=span/count
+        if column>=pyramid.bin_seconds(0):
+            level=pyramid.level_for(column)
+            return column_peaks(pyramid.levels[level],0,pyramid.bin_seconds(level),start,span,count)
+        # Zoomed past the finest envelope: use sample-level detail once the worker has it.
+        detail=self.detail
+        if detail is not None:
+            values,origin,bin_seconds=detail
+            if origin<=start and start+span<=origin+len(values)*bin_seconds and bin_seconds<=column:
+                return column_peaks(values,origin,bin_seconds,start,span,count)
+        self.request_detail(start,span,column)
+        return column_peaks(pyramid.levels[0],0,pyramid.bin_seconds(0),start,span,count)
+
+    def request_detail(self,start,span,column):
+        if self.zooming or self.closed or not self.preview or self.play_btn.cget("state")!="normal":return
+        # Read a window three views wide so small pans reuse it.
+        first=max(0,start-span);last=min(self.duration,start+2*span)
+        key=(round(first,6),round(last,6),round(column,9))
         if key==self.detail_key:return
         self.detail_key=key;self.detail_serial+=1
-        serial=self.detail_serial;path=self.preview;start=self.view_start;span=self.span
-        width=max(1,min(1400,self.canvas.winfo_width()))
-        def decode_visible():
-            if self.closed or serial!=self.detail_serial:return
+        self.detail_request=(self.detail_serial,self.preview,first,last,column/2)
+        if self.detail_worker is None:
+            self.detail_worker=threading.Thread(target=self.detail_loop,daemon=True);self.detail_worker.start()
+        self.detail_event.set()
+        if self.detail_job is None:self.detail_job=self.after(30,self.poll_detail)
+
+    def detail_loop(self):
+        while True:
+            self.detail_event.wait();self.detail_event.clear()
+            if self.closed:return
+            request=self.detail_request
+            if request is None:continue
+            serial,path,first,last,bin_seconds=request
             try:
                 with wave.open(path,"rb") as audio:
                     rate=audio.getframerate();channels=audio.getnchannels()
-                    audio.setpos(min(audio.getnframes(),int(start*rate)))
-                    data=array.array("h");data.frombytes(audio.readframes(int(span*rate)+1))
-                count=len(data);peaks=[]
-                for i in range(width):
-                    if self.closed or serial!=self.detail_serial:return
-                    block=data[i*count//width:(i+1)*count//width]
-                    peaks.append(max((abs(v) for v in block),default=0)/32768)
-                if not self.closed:self.detail_result.put((serial,key,peaks))
-            except (OSError,EOFError,wave.Error):pass
-        threading.Thread(target=decode_visible,daemon=True).start()
-        if self.detail_job is None:self.detail_job=self.after(30,self.poll_detail)
+                    offset=min(audio.getnframes(),int(first*rate));audio.setpos(offset)
+                    raw=audio.readframes(max(1,int((last-first)*rate)+1))
+                samples=np.frombuffer(raw,dtype="<i2",count=len(raw)//(2*channels)*channels).reshape(-1,channels)
+                peaks=np.abs(samples.astype(np.int32)).max(axis=1)
+                size=max(1,int(bin_seconds*rate));whole=len(peaks)//size*size
+                values=peaks[:whole].reshape(-1,size).max(axis=1) if whole else peaks[:0]
+                if whole<len(peaks):values=np.append(values,peaks[whole:].max())
+                if serial==self.detail_serial and not self.closed:
+                    self.detail_result.put((serial,(values.astype(np.uint16),offset/rate,size/rate)))
+            except (OSError,EOFError,wave.Error,ValueError):pass
 
     def poll_detail(self):
         self.detail_job=None
+        latest=None
         try:
             while True:
-                serial,key,peaks=self.detail_result.get_nowait()
-                if serial==self.detail_serial:
-                    self.detail_peaks=peaks;self.detail_draw_key=key;self.paint()
+                serial,detail=self.detail_result.get_nowait()
+                if serial==self.detail_serial:latest=detail
         except queue.Empty:pass
-        if not self.closed:self.detail_job=self.after(40,self.poll_detail)
+        if latest is not None:self.detail=latest;self.paint()
+        elif not self.closed:self.detail_job=self.after(40,self.poll_detail)
 
     def draw_item(self,key,kind,coords,**style):
         item=self.draw_items.get(key)
@@ -768,28 +1011,24 @@ class AudioEditor(ctk.CTkFrame):
         self.used_items=set()
         if self.draw_style_changed:self.canvas.configure(bg="#eeeeef" if light else "#0e0e10")
         width=max(1,self.canvas.winfo_width());height=self.WAVE_H
-        if not self.duration:return
+        if not self.duration:
+            if self.load_state[0]:self.draw_loading()
+            return
         if not self.zooming:
             self.zoom_label.configure(text=f"{self.zoom:.1f}×")
-            self.scrollbar.set(self.view_start/self.duration,(self.view_start+self.span)/self.duration)
+            # CTkScrollbar.set flushes all pending layout work, so only call it when it moves.
+            scroll=(round(self.view_start/self.duration,5),round((self.view_start+self.span)/self.duration,5))
+            if scroll!=getattr(self,"last_scroll",None):self.scrollbar.set(*scroll);self.last_scroll=scroll
         span=max(.000001,self.span);view=self.view_start;scale=width/span
         self.paint_ruler(width)
-        self.request_detail()
         center=self.RULER_H+(height-self.RULER_H)/2
         self.draw_item("track","rectangle",(0,self.RULER_H+14,width,height-14),fill="#dce2ef" if light else "#111a2b",outline="#34496c")
-        points=self.detail_peaks
-        if points is not None and self.detail_draw_key is not None:
-            data_start,data_span,_=self.detail_draw_key
-        else:points=self.peaks;data_start=0;data_span=self.duration
-        upper=[];lower=[]
-        count=max(1,len(points)-1)
-        for x in range(0,width+2,2):
-            sample=((view+x/scale)-data_start)/max(.000001,data_span)*count
-            sample=max(0,min(count,sample));i=int(sample);j=min(i+1,len(points)-1)
-            peak=points[i]+(points[j]-points[i])*(sample-i)
-            amp=max(1,peak*(height-self.RULER_H-34)/2)
-            upper.extend((x,center-amp));lower.append((x,center+amp))
-        shape=upper+[v for pair in reversed(lower) for v in pair]
+        # One column every 2 px, each showing the loudest sample it covers.
+        count=width//2+2;xs=np.arange(count,dtype=np.float64)*2
+        amps=np.maximum(1,self.visible_peaks(view,count*2/scale,count)*(height-self.RULER_H-34)/2)
+        upper=np.column_stack((xs,center-amps)).ravel()
+        lower=np.column_stack((xs[::-1],(center+amps)[::-1])).ravel()
+        shape=np.concatenate((upper,lower)).tolist()
         self.draw_item("wave","polygon",shape,fill="#416ee8" if light else "#8ba5ff",outline="")
         try:
             a=(float(self.start_var.get())-view)*scale;b=(float(self.end_var.get())-view)*scale
@@ -916,13 +1155,27 @@ class AudioEditor(ctk.CTkFrame):
 
     def tags(self):return {key:var.get().strip() for key,var in self.fields.items()}
 
+    def update_fast_hint(self):
+        if not self.fast_var.get():
+            self.fast_hint.configure(text="Off: the trim is re-encoded and cut at the exact time you chose.",text_color=MUTED);return
+        app=self.app
+        settings={"edits":{self.row.path:{"fast":True,"end":1}},"format":app.format_var.get(),"bitrate":app.bitrate_var.get(),
+                  "rate":app.rate_var.get(),"channels":app.channels_var.get()}
+        ok,reason=app.copy_plan(self.row.path,settings)
+        verdict=("With the current output settings this file will be copied." if ok else
+                 f"With the current output settings this file will be re-encoded instead ({reason}).")
+        self.fast_hint.configure(text="Much faster and no quality loss, but cuts snap to the source's packet boundaries, "
+                                      "so the start and end can land a few tens of milliseconds off. Only used for lossy "
+                                      "formats (MP3, AAC, OGG, OPUS, WMA) when the output format and settings match the "
+                                      f"source. {verdict}",text_color=MUTED)
+
     def apply(self):
         try:
             start,end=float(self.start_var.get()),float(self.end_var.get())
             if not (math.isfinite(start) and math.isfinite(end) and 0<=start<end<=self.duration+.01):raise ValueError()
         except ValueError:
             self.notice.configure(text="Choose a valid start and end within the file duration.",text_color=BAD);return
-        self.row.edits={"start":start,"end":end,"tags":self.tags()}
+        self.row.edits={"start":start,"end":end,"tags":self.tags(),"fast":self.fast_var.get()}
         self.row.set_status("Edited",OK);self.destroy()
 
     def save_id3(self):
@@ -1069,6 +1322,16 @@ class App(ctk.CTk):
                     self.play_click()
                 return
             widget=getattr(widget,"master",None)
+
+    def open_timeline(self):
+        from multitrack import Timeline
+        current=getattr(self,"active_editor",None)
+        if isinstance(current,Timeline):
+            current.lift();return
+        if current is not None and current.winfo_exists():current.destroy()
+        self.close_settings()
+        workspace=Timeline(self,sys.modules[__name__])
+        if not workspace.clips and self.rows:workspace.add_queued()
 
     def open_editor(self,row):
         current=getattr(self,"active_editor",None)
@@ -1313,7 +1576,7 @@ class App(ctk.CTk):
                                       text_color=TEXT, text_color_disabled=FAINT)
 
     def option_menu(self, master, values, variable, width=120):
-        return ctk.CTkOptionMenu(master, values=values, variable=variable, width=width,
+        return ResonateDropdown(master, values=values, variable=variable, width=width,
                                  height=32, corner_radius=10, font=font(13),
                                  dropdown_font=font(13), fg_color=CONTROL,
                                  button_color=CONTROL, button_hover_color=CONTROL_HOVER,
@@ -1373,6 +1636,8 @@ class App(ctk.CTk):
         self.caption(top, "Files").pack(side="left")
         self.count_label = ctk.CTkLabel(top, text="", font=font(11), text_color=FAINT)
         self.count_label.pack(side="left", padx=8)
+        self.timeline_btn=self.ghost_button(top,"Timeline",self.open_timeline,width=85)
+        self.timeline_btn.pack(side="right",padx=(6,0))
         self.clear_btn = self.ghost_button(top, "Clear", self.clear_files, width=70)
         self.clear_btn.pack(side="right")
         self.folder_btn = self.ghost_button(top, "Add folder", self.add_folder)
@@ -1507,7 +1772,17 @@ class App(ctk.CTk):
         self.theme_var = ctk.StringVar(value=self.prefs["theme"])
         self.segmented(panel, ["Light", "Dark"], self.theme_var, self.change_theme
                        ).grid(row=13, column=0, pady=(0, 14), **pad)
+        self.caption(panel,"AI isolation device").grid(row=14,column=0,pady=(14,6),**pad)
+        self.isolation_device_var=ctk.StringVar(value=self.prefs["isolation_device"])
+        self.option_menu(panel,["Auto","CPU","NVIDIA CUDA","AMD DirectML (experimental)"],self.isolation_device_var,width=280).grid(row=15,column=0,padx=22,pady=(0,6),sticky="w")
+        self.isolation_device_var.trace_add("write",lambda *args:self.save_isolation_device())
+        ctk.CTkLabel(panel,text="GPU accelerates AI separation. Audio trimming stays on CPU.\nAMD DirectML is experimental; unavailable devices fall back to CPU.",wraplength=275,justify="left",text_color=MUTED,font=font(11)).grid(row=16,column=0,padx=22,pady=(0,18),sticky="w")
+        self.ghost_button(panel,"GPU setup notes",lambda:os.startfile(resource("processing-devices.txt")),width=180).grid(row=17,column=0,padx=22,pady=(0,18),sticky="w")
         return panel
+
+    def save_isolation_device(self):
+        self.prefs['isolation_device']=self.isolation_device_var.get()
+        save_prefs(self.prefs)
 
     def toggle_settings(self):
         if self.settings_open:
@@ -1715,14 +1990,26 @@ class App(ctk.CTk):
                 n += 1
         return dst
 
-    def build_cmd(self, src, dst, s):
-        _, codec, has_bitrate = FORMATS[s["format"]]
-        cmd = [self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-i", src, "-vn"]
+    def copy_plan(self, src, s):
+        """Whether a fast trim can copy audio packets as-is: (allowed, reason it can't)."""
         edit=s.get("edits",{}).get(src,{})
-        if edit.get("end"):
-            cmd += ["-ss",str(edit.get("start",0)),"-t",str(edit["end"]-edit.get("start",0))]
-        cmd += ["-map","0:a:0"]
-        cmd += codec
+        if not (edit.get("fast") and edit.get("end")):return False,""
+        fmt=s["format"]
+        # Lossless outputs re-encode with no quality loss and an exact cut, and a copied FLAC
+        # keeps the source's total length in its header, so copying only pays off for lossy formats.
+        if not FORMATS[fmt][2]:return False,f"{fmt} is lossless, so it's re-encoded exactly with no quality loss"
+        info=probe_audio(self.ffmpeg,src)
+        if info["codec"]!=COPY_CODECS[fmt]:return False,f"source audio is {info['codec'] or 'unknown'}, not {fmt}"
+        if s["rate"]!="Original":return False,"a sample-rate change was requested"
+        if s["channels"]!="Original":return False,"a channel change was requested"
+        if FORMATS[fmt][2]:
+            wanted=int(s["bitrate"][:-1])
+            if not info["bitrate"] or abs(info["bitrate"]-wanted)>max(8,wanted*.05):
+                return False,f"{s['bitrate']} differs from the source's {info['bitrate'] or '?'} kb/s"
+        return True,""
+
+    def encode_args(self, s, has_bitrate):
+        cmd=[]
         if has_bitrate:
             bitrate=s["bitrate"]
             if s["format"]=="MP3" and s["rate"]=="22050":bitrate=str(min(int(bitrate[:-1]),160))+"k"
@@ -1744,6 +2031,24 @@ class App(ctk.CTk):
             cmd += ["-ac", "1"]
         elif s["channels"] == "Stereo":
             cmd += ["-ac", "2"]
+        return cmd
+
+    def build_cmd(self, src, dst, s, copy=False):
+        _, codec, has_bitrate = FORMATS[s["format"]]
+        edit=s.get("edits",{}).get(src,{})
+        trim=bool(edit.get("end"));start=edit.get("start",0) if trim else 0
+        cmd = [self.ffmpeg, "-hide_banner", "-nostdin", "-y"]
+        # Seek on the input to jump near the cut instead of decoding everything before it. When
+        # re-encoding, land a second early and trim that exactly on the output: decoders such as
+        # MP3 need a few frames of history before their first sample is right.
+        preroll=0 if copy else min(start,1.0)
+        if start>0:cmd += ["-ss",f"{start-preroll:.6f}"]
+        cmd += ["-i", src, "-vn"]
+        if preroll>0:cmd += ["-ss",f"{preroll:.6f}"]
+        if trim:cmd += ["-t",f"{edit['end']-start:.6f}"]
+        cmd += ["-map","0:a:0"]
+        if copy:cmd += ["-c:a","copy"]  # copy_plan already checked the settings match the source
+        else:cmd += codec+self.encode_args(s,has_bitrate)
         cmd += ["-map_metadata","0"]
         for key,value in edit.get("tags",{}).items():
             cmd += ["-metadata",("track" if key=="tracknumber" else key)+"="+value]
@@ -1762,13 +2067,14 @@ class App(ctk.CTk):
                                          f"{os.path.basename(src)}")
             self.ui(row.set_status, "0%", TEXT)
             dst = self.output_path(src, s)
+            note = ""
             try:
-                success, err = self.convert_one(src, dst, s, i, total, row)
+                success, err, note = self.convert_one(src, dst, s, i, total, row)
             except Exception as e:  # e.g. ffmpeg missing
                 success, err = False, str(e)
             if success:
                 ok += 1
-                self.ui(row.set_status, "Done", OK)
+                self.ui(row.set_status, "Done" + note, OK)
                 if os.path.dirname(dst) not in self.output_folders:
                     self.output_folders.append(os.path.dirname(dst))
             else:
@@ -1787,10 +2093,24 @@ class App(ctk.CTk):
         self.ui(self.finish, ok, failed, total)
 
     def convert_one(self, src, dst, s, index, total, row):
+        """Returns (success, error, status note)."""
+        copy, reason = self.copy_plan(src, s)
+        note = ""
+        if copy:
+            success, err = self.run_ffmpeg(src, dst, s, index, total, row, True)
+            if success or self.cancel_requested:
+                return success, err, " · copied"
+            reason = "copying failed"
+        if s.get("edits",{}).get(src,{}).get("fast"):
+            note = " · re-encoded"
+            print(f"{src}: fast trim not used, {reason}", file=sys.stderr)
+        return (*self.run_ffmpeg(src, dst, s, index, total, row, False), note)
+
+    def run_ffmpeg(self, src, dst, s, index, total, row, copy):
         duration = get_duration(self.ffmpeg, src)
         edit=s.get("edits",{}).get(src,{})
         if edit.get("end"):duration=edit["end"]-edit.get("start",0)
-        self.proc = subprocess.Popen(self.build_cmd(src, dst, s), stdout=subprocess.PIPE,
+        self.proc = subprocess.Popen(self.build_cmd(src, dst, s, copy), stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, errors="replace",
                                      creationflags=NO_WINDOW)
         # Drain stderr in the background so ffmpeg never blocks on a full pipe.
@@ -1841,4 +2161,27 @@ class App(ctk.CTk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    if len(sys.argv)>2 and sys.argv[1]=='--verify-isolation-engine':
+        from isolation import find_engine
+        from isolation_runtime import launch_engine
+        python=find_engine()
+        report={"frozen":getattr(sys,"frozen",False),"engine":str(python)}
+        try:
+            probe="import sys,ctypes,json,torch;print(json.dumps({'python':sys.version,'ctypes':ctypes.__file__,'torch':torch.__version__,'cuda':torch.cuda.is_available()}))"
+            process=launch_engine(python,['-c',probe],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',creationflags=NO_WINDOW)
+            out,error=process.communicate(timeout=90)
+            if process.returncode:raise RuntimeError(error)
+            report['runtime']=json.loads(out)
+            if len(sys.argv)>3:
+                target=os.path.join(os.path.dirname(os.path.abspath(sys.argv[2])),'frozen-stems')
+                os.makedirs(target,exist_ok=True)
+                process=launch_engine(python,[resource('isolation_runner.py'),sys.argv[3],target,'all','Auto'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',creationflags=NO_WINDOW)
+                out,_=process.communicate(timeout=180)
+                if process.returncode:raise RuntimeError(out)
+                report['stems']=[name for name in os.listdir(target) if name.endswith('.wav')]
+                if len(report['stems'])!=6:raise RuntimeError('Expected six stem files')
+            report['ok']=True
+        except Exception as error:report.update(ok=False,error=str(error))
+        with open(sys.argv[2],'w',encoding='utf-8') as stream:json.dump(report,stream,indent=2)
+    else:
+        App().mainloop()
