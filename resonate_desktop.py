@@ -3,6 +3,7 @@
 import math
 import time
 import tkinter as tk
+import wave
 import array
 import queue
 import json
@@ -18,7 +19,7 @@ import customtkinter as ctk
 from PIL import Image, ImageOps, ImageDraw, ImageTk, ImageGrab
 
 APP_NAME = "Resonate Desktop"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 REPO_URL = "https://github.com/Veloxstudios/resonate-desktop"
 ICON_FILE = "resonate-taskbar.ico"
 SETTINGS_ICON_FILE = "settings.ico"
@@ -450,32 +451,77 @@ class MotionButton(ctk.CTkButton):
         step()
 
 
-class AudioEditor(ctk.CTkToplevel):
+class AudioEditor(ctk.CTkFrame):
     """Per-file tags and waveform selection; source audio stays untouched."""
 
     TAGS = ("title", "artist", "album", "date", "genre", "tracknumber")
+    WAVE_H, RULER_H = 210, 32
+    # Timeline label spacing in seconds; the smallest that leaves ~70 px between labels wins.
+    STEPS = (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600)
+    PLAYHEAD = "#ff6b6b"
 
     def __init__(self, app, row):
-        super().__init__(app,fg_color=BG)
-        self.title("Edit · "+os.path.basename(row.path))
-        self.geometry("700x650"); self.minsize(650,620)
+        super().__init__(app,fg_color=BG,corner_radius=0)
+        self.place(relx=0,rely=0,relwidth=1,relheight=1)
+        self.lift()
+        app.active_editor=self
         self.row,self.app= row,app
         self.duration=0; self.peaks=[]; self.result=queue.Queue()
         self.fields={}
-        ctk.CTkLabel(self,text="Tags & waveform trim",font=font(24),text_color=TEXT).pack(pady=(18,8))
-        self.canvas=tk.Canvas(self,height=145,bg="#101018",highlightthickness=0)
-        self.canvas.pack(fill="x",padx=24,pady=8)
+        self.position=0.0; self.playing=False; self.preview=None; self.preview_proc=None
+        self.alias=f"resonate_preview_{id(self)}"; self.closed=False
+        self.mode=None; self.last_seek=0.0; self.tick_job=None
+        self.zoom=1.0;self.view_start=0.0
+        self.zoom_job=None;self.zoom_target=1.0;self.zooming=False
+        self.precise_timer=False;self.draw_items={};self.hidden_items=set();self.ruler_text={};self.draw_style=None;self.last_clock=None
+        self.app.activity_wave.animate(False)
+        self.detail_draw_key=None
+        self.detail_result=queue.Queue();self.detail_key=None;self.detail_peaks=None
+        self.detail_serial=0;self.detail_job=None
+        header=ctk.CTkFrame(self,fg_color="transparent");header.pack(fill="x",padx=24,pady=(18,8))
+        MotionButton(header,text="← Back",width=85,command=self.destroy).pack(side="left",padx=(0,18))
+        ctk.CTkLabel(header,text="Audio editor",font=font(24),text_color=TEXT).pack(side="left")
+        ctk.CTkLabel(header,text=elide(os.path.basename(row.path),40),font=font(12),text_color=MUTED).pack(side="right")
+        body=ctk.CTkScrollableFrame(self,fg_color=BG,corner_radius=0)
+        body.pack(fill="both",expand=True,padx=8,pady=(0,12))
+        zoom_bar=ctk.CTkFrame(body,fg_color="transparent");zoom_bar.pack(fill="x",padx=16,pady=8)
+        ctk.CTkLabel(zoom_bar,text="AUDIO  /  TRIM",font=font(11),text_color=MUTED).pack(side="left")
+        MotionButton(zoom_bar,text="Fit",width=45,command=lambda:self.set_zoom(1)).pack(side="right",padx=3)
+        MotionButton(zoom_bar,text="Selection",width=85,command=self.zoom_selection).pack(side="right",padx=3)
+        MotionButton(zoom_bar,text="+",width=34,command=lambda:self.set_zoom(self.zoom_target*1.45)).pack(side="right",padx=3)
+        MotionButton(zoom_bar,text="−",width=34,command=lambda:self.set_zoom(self.zoom_target/1.45)).pack(side="right",padx=3)
+        self.zoom_label=ctk.CTkLabel(zoom_bar,text="1×",text_color=MUTED,width=60);self.zoom_label.pack(side="right",padx=8)
+        self.canvas=tk.Canvas(body,height=self.WAVE_H+self.RULER_H,bg="#101018",highlightthickness=0)
+        self.canvas.pack(fill="x",padx=16,pady=(0,0))
+        self.scrollbar=ctk.CTkScrollbar(body,orientation="horizontal",command=self.scroll_timeline)
+        self.scrollbar.pack(fill="x",padx=16,pady=(0,10))
+        self.canvas.bind("<MouseWheel>",self.wheel)
+        self.canvas.bind("<Left>",lambda e:self.nudge(-.01))
+        self.canvas.bind("<Right>",lambda e:self.nudge(.01))
+        self.canvas.bind("<Shift-Left>",lambda e:self.nudge(-.001))
+        self.canvas.bind("<Shift-Right>",lambda e:self.nudge(.001))
         self.canvas.bind("<Configure>",lambda e:self.paint())
         self.canvas.bind("<Button-1>",self.begin_drag)
         self.canvas.bind("<B1-Motion>",self.drag)
-        controls=ctk.CTkFrame(self,fg_color="transparent");controls.pack(fill="x",padx=24)
+        self.canvas.bind("<ButtonRelease-1>",self.end_drag)
+        self.canvas.bind("<Motion>",self.hover)
+        transport=ctk.CTkFrame(body,fg_color="transparent");transport.pack(fill="x",padx=24,pady=(0,6))
+        self.play_btn=MotionButton(transport,text="Play",width=80,command=self.toggle_play,state="disabled")
+        self.play_btn.pack(side="left")
+        self.clock_label=ctk.CTkLabel(transport,text="0:00.0 / 0:00.0",font=font(13),text_color=MUTED)
+        self.clock_label.pack(side="left",padx=12)
+        MotionButton(transport,text="Set end",width=90,command=lambda:self.mark(self.end_var)).pack(side="right")
+        MotionButton(transport,text="Set start",width=90,command=lambda:self.mark(self.start_var)).pack(side="right",padx=6)
+        self.space_binding=app.bind("<space>",self.space,add="+")
+        self.escape_binding=app.bind("<Escape>",lambda e:self.destroy(),add="+")
+        controls=ctk.CTkFrame(body,fg_color="transparent");controls.pack(fill="x",padx=24)
         self.start_var=ctk.StringVar(value=str(row.edits.get("start",0)))
         self.end_var=ctk.StringVar(value=str(row.edits.get("end",0)))
         for label,var in (("Start (seconds)",self.start_var),("End (seconds)",self.end_var)):
             ctk.CTkLabel(controls,text=label,text_color=MUTED).pack(side="left",padx=5)
             entry=ctk.CTkEntry(controls,textvariable=var,width=100);entry.pack(side="left",padx=5)
             entry.bind("<KeyRelease>",lambda e:self.paint())
-        form=ctk.CTkFrame(self,fg_color="transparent");form.pack(fill="x",padx=24,pady=12)
+        form=ctk.CTkFrame(body,fg_color="transparent");form.pack(fill="x",padx=24,pady=12)
         form.grid_columnconfigure(1,weight=1)
         tags={}
         try:
@@ -489,9 +535,9 @@ class AudioEditor(ctk.CTkToplevel):
             ctk.CTkLabel(form,text=key.replace("tracknumber","Track number").title(),text_color=MUTED).grid(row=i,column=0,sticky="w",padx=(0,14),pady=3)
             var=ctk.StringVar(value=tags.get(key,""));self.fields[key]=var
             ctk.CTkEntry(form,textvariable=var).grid(row=i,column=1,sticky="ew",pady=3)
-        self.notice=ctk.CTkLabel(self,text="Loading waveform…",text_color=MUTED,wraplength=640)
+        self.notice=ctk.CTkLabel(body,text="Loading waveform…",text_color=MUTED,wraplength=640)
         self.notice.pack(pady=4)
-        actions=ctk.CTkFrame(self,fg_color="transparent");actions.pack(pady=8)
+        actions=ctk.CTkFrame(body,fg_color="transparent");actions.pack(pady=8)
         MotionButton(actions,text="Apply to converted copy",width=210,command=self.apply).pack(side="left",padx=6)
         self.save_tags=MotionButton(actions,text="Save ID3 to source MP3",width=190,command=self.save_id3)
         self.save_tags.pack(side="left",padx=6)
@@ -501,9 +547,54 @@ class AudioEditor(ctk.CTkToplevel):
         threading.Thread(target=self.decode,daemon=True).start()
         self.poll()
 
+    def destroy(self):
+        if not self.closed:
+            self.cleanup(type("Event",(),{"widget":self})())
+        super().destroy()
+
     def cleanup(self,event):
-        if event.widget is self and self.poll_job is not None:
-            self.after_cancel(self.poll_job);self.poll_job=None
+        if event.widget is not self:return
+        if self.closed:return
+        self.closed=True
+        self.app.unbind("<space>",self.space_binding)
+        self.app.unbind("<Escape>",self.escape_binding)
+        self.app.active_editor=None
+        self.precision_timer(False)
+        if self.app.winfo_exists() and self.app.activity_wave.winfo_exists():self.app.activity_wave.animate(True)
+        self.detail_serial+=1
+        for job in ("poll_job","tick_job","detail_job","zoom_job"):
+            if getattr(self,job) is not None:self.after_cancel(getattr(self,job));setattr(self,job,None)
+        self.mci(f"close {self.alias}")
+        if self.preview_proc is not None and self.preview_proc.poll() is None:self.preview_proc.kill()
+        self.discard_preview()
+
+    def discard_preview(self):
+        if self.preview:
+            # A killed ffmpeg may still hold the file; the decode thread retries once it exits.
+            try:os.remove(self.preview);self.preview=None
+            except FileNotFoundError:self.preview=None
+            except OSError:pass
+
+    def mci(self,command,buffer=None):
+        """Send one Windows MCI command; returns 0 on success."""
+        if sys.platform!="win32":return 1
+        import ctypes
+        return ctypes.windll.winmm.mciSendStringW(command,buffer,len(buffer) if buffer is not None else 0,None)
+
+    def make_preview(self,duration):
+        """Decode a temporary WAV so any input format can be played and seeked."""
+        import tempfile
+        handle,path=tempfile.mkstemp(prefix="resonate-preview-",suffix=".wav");os.close(handle)
+        self.preview=path
+        # Keep hour-long files to a manageable temp size.
+        layout=["-ac","2","-ar","44100"] if duration<=900 else ["-ac","1","-ar","22050"]
+        try:
+            self.preview_proc=subprocess.Popen([self.app.ffmpeg,"-v","error","-y","-i",self.row.path,"-vn",*layout,"-c:a","pcm_s16le",path],
+                                               stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=NO_WINDOW)
+            ok=self.preview_proc.wait()==0
+        except OSError:ok=False
+        if self.closed:self.discard_preview();return
+        self.result.put(("preview",ok))
 
     def decode(self):
         try:
@@ -516,42 +607,312 @@ class AudioEditor(ctk.CTkToplevel):
             step=max(1,len(samples)//600)
             peaks=[max((abs(v) for v in samples[i:i+step]),default=0)/32768 for i in range(0,len(samples),step)]
             if duration<=0 or not peaks: raise ValueError("No audio found")
-            self.result.put((duration,peaks,None))
+            self.result.put(("peaks",duration,peaks,None))
         except Exception as error:
-            self.result.put((0,[],str(error)))
+            self.result.put(("peaks",0,[],str(error)));return
+        if sys.platform=="win32" and not self.closed:self.make_preview(duration)
 
     def poll(self):
         self.poll_job=None
-        try: duration,peaks,error=self.result.get_nowait()
+        try: message=self.result.get_nowait()
         except queue.Empty:
             self.poll_job=self.after(50,self.poll);return
+        if message[0]=="preview":
+            if message[1] and self.mci(f'open "{self.preview}" type waveaudio alias {self.alias}')==0:
+                self.mci(f"set {self.alias} time format milliseconds");self.play_btn.configure(state="normal")
+            else:self.notice.configure(text="Playback isn't available for this file. Trimming still works.",text_color=MUTED)
+            return
+        _,duration,peaks,error=message
         if error: self.notice.configure(text=error,text_color=BAD);return
         self.duration,self.peaks=duration,peaks
         if not self.row.edits.get("end"):self.end_var.set(f"{duration:.3f}")
-        self.notice.configure(text="Drag across the waveform to select a range. Tags and trim apply to the converted copy.")
+        self.notice.configure(text="Drag across the waveform to select a range. Drag the timeline to scrub. Tags and trim apply to the converted copy.")
         self.paint()
+        if sys.platform=="win32":self.poll_job=self.after(50,self.poll)
+
+    @staticmethod
+    def clock(seconds,precise=True):
+        minutes,secs=divmod(max(0,seconds),60)
+        return f"{int(minutes)}:{secs:06.3f}" if precise else f"{int(minutes)}:{int(secs):02d}"
+
+    @property
+    def span(self):return self.duration/max(1,self.zoom)
+
+    def time_x(self,value):return (value-self.view_start)/max(.000001,self.span)*max(1,self.canvas.winfo_width())
+
+    def x_time(self,x):return max(0,min(self.duration,self.view_start+x/max(1,self.canvas.winfo_width())*self.span))
+
+    def precision_timer(self,active):
+        if sys.platform!="win32" or active==self.precise_timer:return
+        import ctypes
+        if active:
+            self.precise_timer=ctypes.windll.winmm.timeBeginPeriod(1)==0
+        else:
+            ctypes.windll.winmm.timeEndPeriod(1);self.precise_timer=False
+
+    def set_zoom(self,value,anchor=None,fraction=None):
+        if not self.duration:return
+        if self.zoom_job is not None:
+            self.after_cancel(self.zoom_job);self.zoom_job=None
+        fraction=.5 if fraction is None else fraction
+        if anchor is None:
+            anchor=self.position
+            if not self.view_start<=anchor<=self.view_start+self.span:anchor=self.view_start+self.span*.5
+        self.zoom_target=max(1,min(value,max(1,self.duration/.05)))
+        start_zoom=self.zoom;start_view=self.view_start
+        final_span=self.duration/self.zoom_target
+        target_view=max(0,min(self.duration-final_span,anchor-fraction*final_span))
+        began=time.perf_counter();self.zooming=True
+        self.precision_timer(True)
+        next_frame=began
+        def tick():
+            nonlocal next_frame
+            self.zoom_job=None
+            frame=time.perf_counter();t=min(1,(frame-began)/.22)
+            ease=t*t*(3-2*t)
+            self.zoom=math.exp(math.log(start_zoom)+(math.log(self.zoom_target)-math.log(start_zoom))*ease)
+            # Keep the point under the mouse fixed as the scale changes.
+            natural=anchor-fraction*self.span
+            initial_natural=anchor-fraction*(self.duration/start_zoom)
+            self.view_start=max(0,min(self.duration-self.span,natural+(start_view-initial_natural)*(1-ease)))
+            if t>=1:
+                self.zoom=self.zoom_target;self.view_start=target_view;self.zooming=False
+            self.paint()
+            if t<1:
+                next_frame+=1/60
+                now=time.perf_counter()
+                if next_frame<now:next_frame=now+1/60
+                self.zoom_job=self.after(max(1,int((next_frame-now)*1000)),tick)
+            else:self.precision_timer(False)
+        tick()
+
+    def zoom_selection(self):
+        try:a,b=float(self.start_var.get()),float(self.end_var.get())
+        except ValueError:return
+        if b>a:self.set_zoom(self.duration/((b-a)*1.15),anchor=(a+b)/2)
+
+    def nudge(self,delta):
+        if not self.duration:return "break"
+        self.position=max(0,min(self.duration,self.position+delta))
+        if not self.view_start<=self.position<=self.view_start+self.span:
+            self.view_start=max(0,min(self.duration-self.span,self.position-self.span/2));self.paint()
+        else:self.place_playhead()
+        if self.playing:self.seek()
+        return "break"
+
+    def scroll_timeline(self,*args):
+        if not self.duration:return
+        if args[0]=="moveto":self.view_start=float(args[1])*self.duration
+        else:self.view_start+=int(args[1])*self.span*(.8 if args[2]=="pages" else .1)
+        self.view_start=max(0,min(self.duration-self.span,self.view_start));self.paint()
+
+    def wheel(self,event):
+        direction=1 if event.delta>0 else -1
+        if event.state&4:
+            fraction=event.x/max(1,self.canvas.winfo_width())
+            self.set_zoom(self.zoom_target*(1.2 if direction>0 else 1/1.2),self.x_time(event.x),fraction)
+            return "break"
+        if event.state&1:
+            self.scroll_timeline("scroll",-direction,"units");return "break"
+
+    def request_detail(self):
+        if self.zooming or not self.preview or self.span>45 or self.closed:return
+        key=(round(self.view_start,4),round(self.span,4),self.canvas.winfo_width())
+        if key==self.detail_key:return
+        self.detail_key=key;self.detail_serial+=1
+        serial=self.detail_serial;path=self.preview;start=self.view_start;span=self.span
+        width=max(1,min(1400,self.canvas.winfo_width()))
+        def decode_visible():
+            if self.closed or serial!=self.detail_serial:return
+            try:
+                with wave.open(path,"rb") as audio:
+                    rate=audio.getframerate();channels=audio.getnchannels()
+                    audio.setpos(min(audio.getnframes(),int(start*rate)))
+                    data=array.array("h");data.frombytes(audio.readframes(int(span*rate)+1))
+                count=len(data);peaks=[]
+                for i in range(width):
+                    if self.closed or serial!=self.detail_serial:return
+                    block=data[i*count//width:(i+1)*count//width]
+                    peaks.append(max((abs(v) for v in block),default=0)/32768)
+                if not self.closed:self.detail_result.put((serial,key,peaks))
+            except (OSError,EOFError,wave.Error):pass
+        threading.Thread(target=decode_visible,daemon=True).start()
+        if self.detail_job is None:self.detail_job=self.after(30,self.poll_detail)
+
+    def poll_detail(self):
+        self.detail_job=None
+        try:
+            while True:
+                serial,key,peaks=self.detail_result.get_nowait()
+                if serial==self.detail_serial:
+                    self.detail_peaks=peaks;self.detail_draw_key=key;self.paint()
+        except queue.Empty:pass
+        if not self.closed:self.detail_job=self.after(40,self.poll_detail)
+
+    def draw_item(self,key,kind,coords,**style):
+        item=self.draw_items.get(key)
+        if item is None:
+            item=getattr(self.canvas,"create_"+kind)(*coords,**style)
+            self.draw_items[key]=item
+        else:
+            self.canvas.coords(item,*coords)
+            if self.draw_style_changed:self.canvas.itemconfigure(item,**style)
+            if key in self.hidden_items:
+                self.canvas.itemconfigure(item,state="normal");self.hidden_items.remove(key)
+        self.used_items.add(key)
+        return item
 
     def paint(self):
-        self.canvas.delete("all")
-        width=max(1,self.canvas.winfo_width());height=145
+        light=ctk.get_appearance_mode()=="Light"
+        self.draw_style_changed=self.draw_style!=light;self.draw_style=light
+        self.used_items=set()
+        if self.draw_style_changed:self.canvas.configure(bg="#eeeeef" if light else "#0e0e10")
+        width=max(1,self.canvas.winfo_width());height=self.WAVE_H
         if not self.duration:return
-        for i,peak in enumerate(self.peaks):
-            x=i*width/max(1,len(self.peaks)-1);amp=max(1,peak*62)
-            self.canvas.create_line(x,height/2-amp,x,height/2+amp,fill="#748dff")
+        if not self.zooming:
+            self.zoom_label.configure(text=f"{self.zoom:.1f}×")
+            self.scrollbar.set(self.view_start/self.duration,(self.view_start+self.span)/self.duration)
+        span=max(.000001,self.span);view=self.view_start;scale=width/span
+        self.paint_ruler(width)
+        self.request_detail()
+        center=self.RULER_H+(height-self.RULER_H)/2
+        self.draw_item("track","rectangle",(0,self.RULER_H+14,width,height-14),fill="#dce2ef" if light else "#111a2b",outline="#34496c")
+        points=self.detail_peaks
+        if points is not None and self.detail_draw_key is not None:
+            data_start,data_span,_=self.detail_draw_key
+        else:points=self.peaks;data_start=0;data_span=self.duration
+        upper=[];lower=[]
+        count=max(1,len(points)-1)
+        for x in range(0,width+2,2):
+            sample=((view+x/scale)-data_start)/max(.000001,data_span)*count
+            sample=max(0,min(count,sample));i=int(sample);j=min(i+1,len(points)-1)
+            peak=points[i]+(points[j]-points[i])*(sample-i)
+            amp=max(1,peak*(height-self.RULER_H-34)/2)
+            upper.extend((x,center-amp));lower.append((x,center+amp))
+        shape=upper+[v for pair in reversed(lower) for v in pair]
+        self.draw_item("wave","polygon",shape,fill="#416ee8" if light else "#8ba5ff",outline="")
         try:
-            a=float(self.start_var.get())/self.duration*width;b=float(self.end_var.get())/self.duration*width
-            self.canvas.create_rectangle(a,2,b,height-2,outline="#ffffff",width=2)
+            a=(float(self.start_var.get())-view)*scale;b=(float(self.end_var.get())-view)*scale
+            if a>0:self.draw_item("shade_left","rectangle",(0,self.RULER_H,min(a,width),height),fill="#000000",stipple="gray50",outline="")
+            if b<width:self.draw_item("shade_right","rectangle",(max(0,b),self.RULER_H,width,height),fill="#000000",stipple="gray50",outline="")
+            self.draw_item("selection","rectangle",(max(0,a),self.RULER_H+13,min(width,b),height-13),outline="#a697ff",width=2)
+            for key,x in (("in",a),("out",b)):
+                if 0<=x<=width:self.draw_item(key,"rectangle",(x-4,self.RULER_H+13,x+4,height-13),fill="#a697ff",outline="")
         except ValueError:pass
+        for key,item in self.draw_items.items():
+            if key not in self.used_items and key not in self.hidden_items:
+                self.canvas.itemconfigure(item,state="hidden");self.hidden_items.add(key)
+        self.place_playhead()
+        self.canvas.tag_raise("playhead")
+
+    def paint_ruler(self,width):
+        self.draw_item("ruler","rectangle",(0,0,width,self.RULER_H),fill="#171719",outline="")
+        span=max(.000001,self.span);scale=width/span
+        step=next((v for v in self.STEPS if v*scale>=85),self.STEPS[-1])
+        small=step/5;start=math.floor(self.view_start/small)
+        for k,n in enumerate(range(start,int((self.view_start+span)/small)+2)):
+            t=n*small;x=(t-self.view_start)*scale;major=n%5==0
+            self.draw_item(f"tick{k}","line",(x,self.RULER_H,x,self.RULER_H-(12 if major else 5)),fill="#777780")
+            if major:
+                key=f"time{k}"
+                item=self.draw_item(key,"text",(x+4,10),text=self.clock(t,step<1),anchor="w",fill="#b0b0bb",font=("Segoe UI",9))
+                text=self.clock(t,step<1)
+                if self.ruler_text.get(key)!=text:
+                    self.canvas.itemconfigure(item,text=text);self.ruler_text[key]=text
+
+    def playhead_x(self):return self.time_x(self.position) if self.duration else 0
+
+    def place_playhead(self):
+        self.canvas.delete("playhead")
+        clock=f"{self.clock(self.position)} / {self.clock(self.duration)}"
+        if clock!=self.last_clock:
+            self.clock_label.configure(text=clock);self.last_clock=clock
+        if not self.duration:return
+        x=self.playhead_x()
+        if not 0<=x<=self.canvas.winfo_width():return
+        self.canvas.create_line(x,0,x,self.WAVE_H,fill=self.PLAYHEAD,width=2,tags="playhead")
+        self.canvas.create_polygon(x-6,0,x+6,0,x,9,fill=self.PLAYHEAD,outline="",tags="playhead")
+
+    def on_scrubber(self,event):
+        return event.y<=self.RULER_H or abs(event.x-self.playhead_x())<=5
+
+    def hover(self,event):
+        if self.mode is None:
+            self.canvas.configure(cursor="sb_h_double_arrow" if self.duration and self.on_scrubber(event) else "")
 
     def begin_drag(self,event):
+        if not self.duration:return
+        self.canvas.focus_set()
         self.anchor=max(0,min(event.x,self.canvas.winfo_width()))
-        self.drag(event)
+        self.anchor_time=self.x_time(self.anchor)
+        self.mode="scrub" if self.on_scrubber(event) else "press"
+        if event.y>self.RULER_H:
+            for key,var in (("start",self.start_var),("end",self.end_var)):
+                try:
+                    if abs(event.x-self.time_x(float(var.get())))<8:self.mode=key
+                except ValueError:pass
+        if self.mode=="scrub":self.scrub(event.x)
 
     def drag(self,event):
-        if not self.duration:return
+        if not self.duration or self.mode is None:return
         x=max(0,min(event.x,self.canvas.winfo_width()));w=max(1,self.canvas.winfo_width())
-        self.start_var.set(f"{min(self.anchor,x)/w*self.duration:.3f}")
-        self.end_var.set(f"{max(self.anchor,x)/w*self.duration:.3f}");self.paint()
+        if self.mode=="scrub":self.scrub(x);return
+        if self.mode in ("start","end"):
+            value=self.x_time(x)
+            if self.mode=="start":self.start_var.set(f"{min(value,float(self.end_var.get())-.001):.3f}")
+            else:self.end_var.set(f"{max(value,float(self.start_var.get())+.001):.3f}")
+            self.paint();return
+        # A press only becomes a range selection once the mouse has really moved.
+        if self.mode=="press" and abs(x-self.anchor)<4:return
+        self.mode="select"
+        self.start_var.set(f"{min(self.anchor_time,self.x_time(x)):.3f}")
+        self.end_var.set(f"{max(self.anchor_time,self.x_time(x)):.3f}");self.paint()
+
+    def end_drag(self,event):
+        if self.mode=="press":self.scrub(self.anchor)  # A plain click moves the playhead.
+        if self.mode in ("scrub","press") and self.playing:self.seek()
+        self.mode=None;self.hover(event)
+
+    def scrub(self,x):
+        w=max(1,self.canvas.winfo_width())
+        self.position=self.x_time(max(0,min(x,w)));self.place_playhead()
+        # Follow the drag while playing, without flooding MCI with seeks.
+        if self.playing and time.monotonic()-self.last_seek>0.12:self.seek()
+
+    def seek(self):
+        self.last_seek=time.monotonic()
+        self.mci(f"play {self.alias} from {int(self.position*1000)}")
+
+    def toggle_play(self):
+        if self.playing:
+            self.playing=False;self.mci(f"stop {self.alias}");self.play_btn.configure(text="Play");return
+        if self.position>=self.duration-0.05:self.position=0.0
+        self.playing=True;self.play_btn.configure(text="Pause");self.seek();self.tick()
+
+    def tick(self):
+        self.tick_job=None
+        if not self.playing:return
+        import ctypes
+        buffer=ctypes.create_unicode_buffer(64)
+        self.mci(f"status {self.alias} mode",buffer)
+        if buffer.value!="playing":
+            self.playing=False;self.play_btn.configure(text="Play")
+            if buffer.value=="stopped" and self.mode!="scrub":self.position=self.duration
+            self.place_playhead();return
+        if self.mode!="scrub" and self.mci(f"status {self.alias} position",buffer)==0 and buffer.value.isdigit():
+            self.position=int(buffer.value)/1000
+            if not self.view_start<=self.position<=self.view_start+self.span:
+                self.view_start=min(max(0,self.duration-self.span),self.position);self.paint()
+            else:self.place_playhead()
+        self.tick_job=self.after(30,self.tick)
+
+    def mark(self,var):
+        if not self.duration:return
+        var.set(f"{self.position:.3f}");self.paint()
+
+    def space(self,event):
+        if isinstance(self.focus_get(),tk.Entry) or self.play_btn.cget("state")=="disabled":return
+        self.play_btn.invoke();return "break"
 
     def tags(self):return {key:var.get().strip() for key,var in self.fields.items()}
 
@@ -600,7 +961,7 @@ class FileRow(ctk.CTkFrame):
                                         text_color=MUTED, font=font(12),
                                         command=lambda: on_remove(self))
         self.remove_btn.grid(row=0, column=3, rowspan=2, padx=(0, 10))
-        self.edit_btn=MotionButton(self,text="Edit",width=55,height=28,command=lambda:AudioEditor(self.winfo_toplevel(),self))
+        self.edit_btn=MotionButton(self,text="Edit",width=55,height=28,command=lambda:self.winfo_toplevel().open_editor(self))
         self.edit_btn.grid(row=0,column=2,rowspan=2,padx=6)
         for w in (self, name, folder, self.status):
             w.bind("<Enter>", lambda e: self.configure(fg_color=ROW_HOVER))
@@ -708,6 +1069,12 @@ class App(ctk.CTk):
                     self.play_click()
                 return
             widget=getattr(widget,"master",None)
+
+    def open_editor(self,row):
+        current=getattr(self,"active_editor",None)
+        if current is not None and current.winfo_exists():current.destroy()
+        self.close_settings()
+        AudioEditor(self,row)
 
     def play_click(self):
         if not self.prefs.get("sound",True) or sys.platform!="win32":
