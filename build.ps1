@@ -11,10 +11,10 @@ New-Item -ItemType Directory -Force build\bin | Out-Null
 Copy-Item $ffmpeg build\bin\ffmpeg.exe -Force
 
 python -m PyInstaller --noconfirm --onefile --windowed `
-    --name "Resonate Desktop" --icon "..\resonate.ico" `
+    --name "Resonate Desktop" --icon "..\resonate-taskbar.ico" `
     --exclude-module imageio_ffmpeg --collect-all customtkinter `
     --add-binary "bin\ffmpeg.exe;." `
-    --add-data "..\resonate.ico;." --add-data "..\settings.ico;." `
+    --add-data "..\resonate.ico;." --add-data "..\resonate-taskbar.ico;." --add-data "..\settings.ico;." --add-data "..\welcome.mp3;." --add-data "..\welcome-bed.mp3;." --add-data "..\loading-bed.mp3;." --add-data "..\loading-wave.json;." --add-data "..\click.wav;." `
     --workpath build --specpath build --distpath dist `
     resonate_desktop.py
 
